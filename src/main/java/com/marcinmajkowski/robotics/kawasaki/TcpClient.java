@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 
 public class TcpClient {
@@ -66,13 +67,13 @@ public class TcpClient {
         }
     }
 
-    public String getResponse(String command) {
+    public String getResponse(String command) throws IOException {
         return (getResponses(command)).get(0);
     }
 
-    public synchronized List<String> getResponses(String... commands) {
+    public synchronized List<String> getResponses(String... commands) throws IOException {
         if (!telnetClient.isConnected()) {
-            connect();
+            connectToController();
         }
         List<String> responses = new ArrayList<>();
 
@@ -80,26 +81,61 @@ public class TcpClient {
             // discard everything from stream
             InputStream in = telnetClient.getInputStream();
             System.out.println("Discarding stream content...");
-            try {
-                while (in.available() > 0) {
-                    in.read();
-                }
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
+            in.skip(in.available());
 
             PrintWriter out = new PrintWriter(telnetClient.getOutputStream(), true);
             out.println(command);
 
             System.out.println("Reading response...");
             StringBuilder response = new StringBuilder();
-            int readByte;
-            try {
+            if (command.toLowerCase().startsWith("save")) {
+                //TODO extract to method
+                // reading file from robot controller
+                // reading and skipping everything until 0x17
+                long timeout = 500; //TODO
+                int skipped = skipUntil(in, new byte[]{0x17}, timeout);
+                System.out.println("Skipped " + skipped + " bytes");
+                // sending file transfer start sequence
+                System.out.println("Sending start sequence");
+                //TODO move such sequences to constants
+                out.print(new char[]{0x02, 0x42, 0x20, 0x20, 0x20, 0x20, 0x30, 0x17});
+                out.flush();
+                System.out.println("Start sequence sent");
+
+                // separating messages from file content
+                boolean message = true;
+                while(true) {
+                    byte[] readBytes;
+                    if (message) {
+                        readBytes = readUntil(in, toBytes(0x05, 0x02), timeout);
+                        System.out.print(new String(readBytes));
+                        if (in.read() == 0x45) {
+                            // skipping 0x17
+                            in.skip(1);
+                            break;
+                        }
+                    } else {
+                        readBytes = readUntil(in, toBytes(0x17), timeout);
+                        response.append(new String(readBytes));
+                    }
+                    message = !message;
+                }
+
+                System.out.println("Sending end sequence");
+                out.print(new char[]{0x02, 0x45, 0x20, 0x20, 0x20, 0x20, 0x30, 0x17});
+                out.flush();
+                System.out.println("End sequence sent");
+                // discarding everything until '>'
+                skipped = skipUntil(in, new byte[]{'>'}, timeout);
+                System.out.println("Skipped " + skipped + " bytes");
+            } else if (command.toLowerCase().startsWith("load")) {
+                //TODO sending file to robot
+            } else {
+                int readByte;
+                //TODO '>' can be a part of response
                 while ((readByte = in.read()) != '>') {
                     response.append((char) readByte);
                 }
-            } catch (IOException e) {
-                e.printStackTrace();
             }
             System.out.println("Response read!");
 
@@ -120,25 +156,17 @@ public class TcpClient {
         return responses;
     }
 
-    private void connect() {
-        try {
-            telnetClient.connect(hostname, port);
-            login();
-        } catch (IOException e) {
-            System.err.println("Error connecting to Telnet server: " + e.getMessage());
-        }
+    private void connectToController() throws IOException {
+        telnetClient.connect(hostname, port);
+        loginToController();
     }
 
-    private void login() {
+    private void loginToController() throws IOException {
         PrintWriter out = new PrintWriter(telnetClient.getOutputStream(), true);
         out.println(login);
         System.out.println("Login sent!");
         InputStream in = telnetClient.getInputStream();
-        try {
-            while (in.read() != '>') {
-            }
-        } catch (IOException e) {
-            e.printStackTrace();
+        while (in.read() != '>') {
         }
         System.out.println("Logged in!");
         //TODO send "messages off" to disable messages output to the terminal
@@ -146,11 +174,65 @@ public class TcpClient {
     }
 
     private void disconnect() {
+        //TODO restore messages and screen switches
         try {
             telnetClient.disconnect();
         } catch (IOException e) {
             System.err.println("Error disconnecting from Telnet server: " + e.getMessage());
         }
+    }
+
+    /**
+     * Skips all bytes from in until (and including) terminator.
+     *
+     * @param in
+     * @param terminator
+     * @param timeout
+     * @return Number of bytes skipped
+     * @throws IOException
+     */
+    private int skipUntil(InputStream in, byte[] terminator, long timeout) throws IOException {
+        return readUntil(in, terminator, timeout).length;
+    }
+
+    private byte[] readUntil(InputStream in, byte[] terminator, long timeout) throws IOException {
+        //TODO implement timeout
+        List<Byte> bytes = new ArrayList<>();
+        int index = 0;
+        int[] buffer = new int[terminator.length];
+        // reading until receiving ending sequence
+        while (index < terminator.length) {
+            int readByte = in.read();
+            if (((byte) readByte) == terminator[index]) {
+                buffer[index] = readByte;
+                index++;
+            } else {
+                // returning buffered bytes to output list
+                for (int i = 0; i < index; i++) {
+                    bytes.add((byte) buffer[i]);
+                }
+                bytes.add((byte) readByte);
+                index = 0;
+            }
+        }
+        return toArrayOfPrimitives(bytes);
+    }
+
+    private byte[] toArrayOfPrimitives(List<Byte> bytes) {
+        byte[] result = new byte[bytes.size()];
+        Iterator<Byte> iterator = bytes.iterator();
+        for (int i = 0; i < result.length; i++) {
+            result[i] = iterator.next();
+        }
+        return result;
+    }
+
+    private byte[] toBytes(int... ints) {
+        byte[] result = new byte[ints.length];
+        for (int i = 0; i < ints.length; i++) {
+            result[i] = (byte) ints[i];
+        }
+        return result;
     }
 
     public String getHostname() {

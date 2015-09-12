@@ -8,7 +8,10 @@ import org.apache.commons.net.telnet.TerminalTypeOptionHandler;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 
@@ -72,6 +75,7 @@ public class TcpClient {
     }
 
     public synchronized List<String> getResponses(String... commands) throws IOException {
+        //TODO how to pass file to load (or where to put it)
         if (!telnetClient.isConnected()) {
             connectToController();
         }
@@ -104,7 +108,7 @@ public class TcpClient {
 
                 // separating messages from file content
                 boolean message = true;
-                while(true) {
+                while (true) {
                     byte[] readBytes;
                     if (message) {
                         readBytes = readUntil(in, toBytes(0x05, 0x02), timeout);
@@ -129,7 +133,48 @@ public class TcpClient {
                 skipped = skipUntil(in, new byte[]{'>'}, timeout);
                 System.out.println("Skipped " + skipped + " bytes");
             } else if (command.toLowerCase().startsWith("load")) {
-                //TODO sending file to robot
+                //TODO extracting filename
+                String filename = command.split("\\s+")[1];
+                //TODO extract to method
+                // sending file to robot controller
+                // reading and skipping everything until 0x17
+                long timeout = 500; //TODO
+                int skipped = skipUntil(in, new byte[]{0x17}, timeout);
+                System.out.println("Skipped " + skipped + " bytes");
+                // sending file transfer start sequence
+                System.out.println("Sending start sequence");
+                //TODO move such sequences to constants
+                out.print(new char[]{0x02, 0x41, 0x20, 0x20, 0x20, 0x20, 0x30, 0x17});
+                out.flush();
+                System.out.println("Start sequence sent");
+                byte[][] terminators = new byte[2][];
+                terminators[0] = toBytes(0x05, 0x02, 0x43, 0x17);
+                terminators[1] = "Are you sure ? (Yes:1, No:0) \r\n".getBytes();
+//                String fileToLoad = ".REALS\r\nfileLoaded = 42\r\n.END";
+                String fileToLoad = new String(Files.readAllBytes(Paths.get(filename)));
+                int chunkSize = 512;
+                byte[][] chunks = splitIntoChunks(fileToLoad.getBytes(), chunkSize);
+                for (byte[] chunk : chunks) {
+                    int terminatorIndex = -1;
+                    while (terminatorIndex != 0) {
+                        ReadUntilResult result = readUntil(in, terminators, timeout);
+                        System.out.println(new String(result.data)); //TODO
+                        terminatorIndex = result.terminatorIndex;
+                        if (terminatorIndex == 1) {
+                            out.println("1\r\n");
+                        }
+                    }
+                    out.print(new char[]{0x02, 0x43, 0x20, 0x20, 0x20, 0x20, 0x30});
+                    out.print((new String(chunk)).toCharArray()); //TODO byte[] to char[]
+                    out.print(new char[]{0x17});
+                    out.flush();
+                }
+                out.print(new char[]{0x02, 0x43, 0x20, 0x20, 0x20, 0x20, 0x1a, 0x17});
+                out.flush();
+                System.out.println(new String(readUntil(in, toBytes(0x05, 0x02, 0x45, 0x17), timeout)));
+                out.print(new char[]{0x02, 0x45, 0x20, 0x20, 0x20, 0x20, 0x30, 0x17});
+                out.flush();
+                System.out.println(new String(readUntil(in, new byte[]{'>'}, timeout)));
             } else {
                 int readByte;
                 //TODO '>' can be a part of response
@@ -191,11 +236,11 @@ public class TcpClient {
      * @return Number of bytes skipped
      * @throws IOException
      */
-    private int skipUntil(InputStream in, byte[] terminator, long timeout) throws IOException {
+    private static int skipUntil(InputStream in, byte[] terminator, long timeout) throws IOException {
         return readUntil(in, terminator, timeout).length;
     }
 
-    private byte[] readUntil(InputStream in, byte[] terminator, long timeout) throws IOException {
+    private static byte[] readUntil(InputStream in, byte[] terminator, long timeout) throws IOException {
         //TODO implement timeout
         List<Byte> bytes = new ArrayList<>();
         int index = 0;
@@ -218,7 +263,43 @@ public class TcpClient {
         return toArrayOfPrimitives(bytes);
     }
 
-    private byte[] toArrayOfPrimitives(List<Byte> bytes) {
+    private static class ReadUntilResult {
+        public byte[] data;
+        public int terminatorIndex;
+    }
+
+    private static ReadUntilResult readUntil(InputStream in, byte[][] terminators, long timeout) throws IOException {
+        //TODO implement timeout (and special value for infinite timeout)
+        //TODO what if terminators is empty or one of terminators is empty
+        //TODO assert not null input
+        List<Byte> bytes = new ArrayList<>();
+        int[] indexes = new int[terminators.length];
+        int terminatorIndex;
+        outerLoop:
+        while (true) {
+            int readByte = in.read();
+            bytes.add((byte) readByte);
+            for (int i = 0; i < terminators.length; i++) {
+                terminatorIndex = i;
+                if (((byte) readByte) == terminators[i][indexes[i]]) {
+                    indexes[i]++;
+                    if (indexes[i] >= terminators[i].length) {
+                        break outerLoop;
+                    }
+                } else {
+                    indexes[i] = 0;
+                }
+            }
+        }
+
+        ReadUntilResult result = new ReadUntilResult();
+        result.data = toArrayOfPrimitives(bytes.subList(0, bytes.size() - terminators[terminatorIndex].length));
+        result.terminatorIndex = terminatorIndex;
+
+        return result;
+    }
+
+    private static byte[] toArrayOfPrimitives(List<Byte> bytes) {
         byte[] result = new byte[bytes.size()];
         Iterator<Byte> iterator = bytes.iterator();
         for (int i = 0; i < result.length; i++) {
@@ -227,10 +308,25 @@ public class TcpClient {
         return result;
     }
 
-    private byte[] toBytes(int... ints) {
+    private static byte[] toBytes(int... ints) {
         byte[] result = new byte[ints.length];
         for (int i = 0; i < ints.length; i++) {
             result[i] = (byte) ints[i];
+        }
+        return result;
+    }
+
+    private static byte[][] splitIntoChunks(byte[] data, int chunkSize) {
+        // ceiling division, same result as Math.ceil((double) data.length / chunkSize)
+        int numberOfChunks = (data.length + chunkSize - 1) / chunkSize;
+        byte[][] result = new byte[numberOfChunks][];
+        for (int i = 0; i < numberOfChunks; i++) {
+            int from = i * chunkSize;
+            int to = from + chunkSize;
+            if (to > data.length) {
+                to = data.length;
+            }
+            result[i] = Arrays.copyOfRange(data, from, to);
         }
         return result;
     }
